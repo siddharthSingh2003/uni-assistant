@@ -1,0 +1,15 @@
+# Replace @member-N with GitHub usernames. PRs touching these paths need that member's review.
+/shared/schemas.py   @member-1 @member-2 @member-3 @member-4
+/shared/config.py    @member-4
+/shared/llm.py       @member-3
+/ingestion/          @member-1
+/docs/               @member-1
+/data/               @member-2
+/tools/              @member-2
+/scripts/load_students.py @member-2
+/graph/              @member-3
+/api/                @member-4
+/ui/                 @member-4
+/eval/               @member-4
+/Dockerfile          @member-4
+/docker-compose.yml  @member-4

@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.env
+storage/
+eval/results/
+.pytest_cache/
+.venv/
+storage_eval/
+.ruff_cache/
