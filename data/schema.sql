@@ -76,6 +76,34 @@ CREATE TABLE IF NOT EXISTS source_register (
     file_path TEXT, ingested_at TEXT
 );
 
+-- extra: the original file of every ingested document, so the portal can show and download it.
+CREATE TABLE IF NOT EXISTS document_files (
+    doc_id       TEXT PRIMARY KEY,
+    filename     TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    size         INTEGER NOT NULL,
+    content      BLOB NOT NULL,
+    uploaded_by  TEXT NOT NULL DEFAULT '',
+    stored_at    TEXT NOT NULL
+);
+
+-- extra: student uploads wait here until an admin approves them; nothing is indexed before that.
+CREATE TABLE IF NOT EXISTS pending_uploads (
+    upload_id    TEXT PRIMARY KEY,
+    student_id   TEXT NOT NULL,
+    filename     TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    size         INTEGER NOT NULL,
+    content      BLOB NOT NULL,
+    status       TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected')),
+    submitted_at TEXT NOT NULL,
+    reviewed_by  TEXT,
+    reviewed_at  TEXT,
+    note         TEXT,
+    doc_id       TEXT                      -- the document it became, once approved
+);
+CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_uploads(status);
+
 CREATE TABLE IF NOT EXISTS audit_log (
     trace_id    TEXT PRIMARY KEY,
     created_at  TEXT NOT NULL,

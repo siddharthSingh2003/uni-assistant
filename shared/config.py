@@ -158,6 +158,24 @@ class Settings:
         # password of the admin account created on first start, when there is no admin yet
         return os.getenv("ADMIN_PASSWORD", "Admin@123")
 
+    @property
+    def max_upload_mb(self) -> int:
+        return int(os.getenv("MAX_UPLOAD_MB", "25"))
+
+    @property
+    def max_student_upload_mb(self) -> int:
+        return int(os.getenv("MAX_STUDENT_UPLOAD_MB", "10"))
+
+    @property
+    def max_student_uploads_per_day(self) -> int:
+        # counts every submission in the last 24 hours, including rejected ones
+        return int(os.getenv("MAX_STUDENT_UPLOADS_PER_DAY", "5"))
+
+    @property
+    def max_pending_uploads(self) -> int:
+        # how many documents one student may have waiting for review at a time
+        return int(os.getenv("MAX_PENDING_UPLOADS", "3"))
+
     # ---- Storage -----------------------------------------------------------
     @property
     def storage_dir(self) -> Path:

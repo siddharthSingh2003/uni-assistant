@@ -8,25 +8,22 @@ import json
 import logging
 import shutil
 import tempfile
-import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Response, UploadFile
 from pydantic import ValidationError
 
 from api import audit
 from api.auth import User, current_user, require_admin, router as auth_router
+from api.documents import check_upload, ingest_with_extraction, router as documents_router, submit_for_review
 from data import credentials
 from data.db import init_db, one
 from data.loader import LoadError, load_dir
 from data.validate import REQUIRED
 from graph.workflow import run_question
-from ingestion import source_register
-from ingestion.cleaner import clean_pages
-from ingestion.loader import load_document
-from ingestion.metadata_extractor import extract_metadata
+from ingestion import document_store, source_register
 from ingestion.pipeline import bootstrap, ingest_file
 from ingestion.vector_store import get_store
 from shared.config import RetrievalConfig, settings
@@ -49,6 +46,7 @@ async def lifespan(app: FastAPI):
         log.info("credentials initialised for %d student(s)", credentials.ensure_credentials())
         if credentials.ensure_admin():
             log.info("created admin account '%s'", settings.admin_username)
+        log.info("document files stored for %d earlier document(s)", document_store.backfill())
     except Exception as e:  # noqa: BLE001 - the API must still start and report via /health
         log.error("startup seeding failed: %s", e)
     yield
@@ -56,6 +54,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="University Student Services Assistant", version="1.0.0", lifespan=lifespan)
 app.include_router(auth_router)
+app.include_router(documents_router)
 
 
 @app.post("/ask", response_model=AskResponse)
@@ -69,56 +68,37 @@ def ask(req: AskRequest, user: User = Depends(current_user)):
 
 
 @app.post("/ingest", response_model=IngestResponse)
-def ingest(file: UploadFile = File(...), metadata: Optional[str] = Form(default=None),
+def ingest(response: Response, file: UploadFile = File(...), metadata: Optional[str] = Form(default=None),
            authority_level: Optional[int] = Form(default=None, ge=1, le=5), user: User = Depends(current_user)):
     """An admin sends either `authority_level` alone (the rest of the metadata is read from the
-    document) or the full `metadata` JSON of the original contract. A student may also add a
-    document, but only as level 5 (unofficial): it is informational, can never override an official
-    source or set a rule, and cannot replace a document the student did not upload."""
+    document) or the full `metadata` JSON of the original contract; the document is indexed at once.
+    A student's upload is NOT indexed: it is held for an admin to review (202, status
+    pending_review) and, if approved, is ingested as level 5 (unofficial)."""
     is_staff = user.is_admin or not settings.auth_required      # legacy contract has no roles
+    content = file.file.read(settings.max_upload_mb * 1024 * 1024 + 1)
+    filename = Path(file.filename or "").name
+    suffix = check_upload(filename, len(content), None if is_staff else settings.max_student_upload_mb)
     if not is_staff:
         if metadata is not None:
             raise HTTPException(403, "Only an admin can supply metadata. Upload the file alone.")
-        authority_level = 5                                      # whatever the student sent
-    suffix = Path(file.filename or "").suffix.lower() or ".pdf"
-    settings.uploads_dir.mkdir(parents=True, exist_ok=True)
-    extracted_by = None
-    if metadata is not None:
-        try:
-            meta = IngestMetadata.model_validate(json.loads(metadata))
-        except (json.JSONDecodeError, ValidationError) as e:
-            raise HTTPException(422, f"invalid metadata: {e}")
-        dest = settings.uploads_dir / f"{meta.doc_id}{suffix}"
-        with dest.open("wb") as fh:
-            shutil.copyfileobj(file.file, fh)
-    elif authority_level is None:
-        raise HTTPException(422, "send authority_level (metadata is then extracted) or the full metadata JSON")
-    else:
-        tmp = settings.uploads_dir / f"_incoming-{uuid.uuid4().hex}{suffix}"
-        with tmp.open("wb") as fh:
-            shutil.copyfileobj(file.file, fh)
-        try:
-            text = "\n".join(p.text for p in clean_pages(load_document(tmp)))
-            if not text.strip():
-                raise ValueError(f"No text could be extracted from {file.filename} (even with OCR)")
-            doc_meta, extracted_by = extract_metadata(text, Path(file.filename or tmp.name).name, authority_level,
-                                                      uploaded_by=user.id or "legacy")
-        except ValueError as e:
-            tmp.unlink(missing_ok=True)
-            raise HTTPException(422, str(e))
-        if not is_staff:
-            # a doc_id of their own, so a student upload can never take the place of an official document
-            doc_meta = doc_meta.model_copy(update={"doc_id": f"STU-{user.id}-{doc_meta.doc_id}"[:80],
-                                                   "doc_type": "unofficial"})
-            extracted_by.update(authority_level="fixed for student uploads", doc_type="fixed for student uploads")
-        meta = IngestMetadata(**doc_meta.model_dump())
-        dest = settings.uploads_dir / f"{meta.doc_id}{suffix}"
-        tmp.replace(dest)
+        response.status_code = 202
+        return submit_for_review(user.id, filename, content)
+    if metadata is None:
+        if authority_level is None:
+            raise HTTPException(422, "send authority_level (metadata is then extracted) or the full metadata JSON")
+        return ingest_with_extraction(content, filename, authority_level, uploaded_by=user.id or "legacy")
     try:
-        result = ingest_file(dest, meta)
+        meta = IngestMetadata.model_validate(json.loads(metadata))
+    except (json.JSONDecodeError, ValidationError) as e:
+        raise HTTPException(422, f"invalid metadata: {e}")
+    settings.uploads_dir.mkdir(parents=True, exist_ok=True)
+    dest = settings.uploads_dir / f"{meta.doc_id}{suffix}"
+    dest.write_bytes(content)
+    try:
+        result = ingest_file(dest, meta, uploaded_by=user.id or "legacy")
     except ValueError as e:
         raise HTTPException(422, str(e))
-    result.metadata, result.extracted_by = meta.to_flat(), extracted_by
+    result.metadata = meta.to_flat()
     added = 0
     for r in meta.rules:
         add_rule(r, origin="ingest")
@@ -148,12 +128,10 @@ def health():
 
 
 @app.get("/audit/{trace_id}")
-def get_audit(trace_id: str, user: User = Depends(current_user)):
+def get_audit(trace_id: str, admin: User = Depends(require_admin)):
+    """Admin only: a trace holds a student's records and the system's internal reasoning."""
     rec = audit.get(trace_id)
-    # a trace holds one student's records: only that student (or an admin) may read it, and
-    # other students cannot tell it exists
-    own = user.is_admin or rec is None or rec.get("student_id") == user.student_id
-    if rec is None or (settings.auth_required and not own):
+    if rec is None:
         raise HTTPException(404, "trace_id not found")
     return rec
 

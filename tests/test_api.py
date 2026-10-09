@@ -1,5 +1,6 @@
 """M4: API contract (Section 6) and live ingestion."""
 import json
+import os
 
 from fastapi.testclient import TestClient
 
@@ -47,9 +48,11 @@ def test_login_is_required_and_scopes_data():
 
         r = c.post("/ask", json=BODY, headers=s4).json()
         assert r["tools_invoked"][0]["output"]["attendance_pct"] == 77.5            # S1004's own record
-        assert c.get(f"/audit/{r['trace_id']}", headers=s4).status_code == 200
-        assert c.get(f"/audit/{r['trace_id']}", headers=s5).status_code == 404      # not another student's trace
+        assert c.get(f"/audit/{r['trace_id']}", headers=s4).status_code == 403      # audit is for admins only,
+        assert c.get(f"/audit/{r['trace_id']}", headers=s5).status_code == 403      # even for your own trace
         assert c.get(f"/audit/{r['trace_id']}").status_code == 401
+        audited = c.get(f"/audit/{r['trace_id']}", headers=login(c, "admin"))
+        assert audited.status_code == 200 and audited.json()["student_id"] == "S1004"
         other = c.post("/ask", json={"question": "What is the attendance of S1004?"}, headers=s5).json()
         assert other["answer_type"] == "refused"
 
@@ -63,12 +66,63 @@ def test_only_admin_adds_documents_and_metadata_is_extracted():
         note = {"file": ("note.txt", b"CIRCULAR No. EXAM/2026/14\nOffice of the Dean. Dated 1 September 2026.\n"
                                      b"1 A student must have a minimum attendance of 50% in each course to be "
                                      b"permitted to appear in the end-semester examination.\n")}
+        # a student's upload is held for review: nothing is indexed until an admin approves it
         mine = c.post("/ingest", files=note, data={"authority_level": "1"}, headers=s4)   # asks for level 1
-        assert mine.status_code == 200, mine.text
-        sm = mine.json()["metadata"]
+        assert mine.status_code == 202 and mine.json()["status"] == "pending_review", mine.text
+        uid = mine.json()["upload_id"]
+        assert not any(s["doc_id"].startswith("STU-") for s in c.get("/sources").json())
+        assert [u["status"] for u in c.get("/uploads/mine", headers=s4).json()] == ["pending"]
+        assert c.get("/uploads/mine", headers=login(c, "S1005")).json() == []          # only your own
+        assert c.get("/admin/uploads", headers=s4).status_code == 403
+        assert c.post(f"/admin/uploads/{uid}/approve", headers=s4).status_code == 403
+        assert c.get(f"/admin/uploads/{uid}/file", headers=s4).status_code == 403
+        assert [u["upload_id"] for u in c.get("/admin/uploads", headers=admin).json()] == [uid]
+        seen = c.get(f"/admin/uploads/{uid}/file", headers=admin)                       # the admin reads it first
+        assert seen.content == note["file"][1] and seen.headers["content-type"].startswith("text/plain")
+
+        rejected = c.post("/ingest", files={"file": ("spam.txt", b"buy now")}, headers=s4).json()["upload_id"]
+        assert c.post(f"/admin/uploads/{rejected}/reject", json={"note": "not a university document"},
+                      headers=admin).status_code == 200
+        assert c.post(f"/admin/uploads/{rejected}/approve", headers=admin).status_code == 409   # already closed
+
+        ok = c.post(f"/admin/uploads/{uid}/approve", headers=admin)
+        assert ok.status_code == 200, ok.text
+        sm = ok.json()["metadata"]
         assert sm["authority_level"] == 5 and sm["doc_type"] == "unofficial"            # always unofficial
-        assert sm["doc_id"] == "STU-S1004-EXAM-2026-14" and mine.json()["rules_extracted"] == 0
+        assert sm["doc_id"] == "STU-S1004-EXAM-2026-14" and ok.json()["rules_extracted"] == 0
+        assert {u["status"]: u["note"] for u in c.get("/uploads/mine", headers=s4).json()} == \
+            {"approved": "", "rejected": "not a university document"}
+        assert c.get("/admin/uploads", headers=admin).json() == []                      # queue is empty again
         assert c.post("/ingest", files=note, data={"metadata": json.dumps(META)}, headers=s4).status_code == 403
+        assert c.post("/ingest", files={"file": ("virus.exe", b"MZ")}, headers=s4).status_code == 415
+
+        # a student cannot spam the review queue
+        resend = lambda name, data, who=s4: c.post("/ingest", files={"file": (name, data)}, headers=who)  # noqa: E731
+        assert resend("renamed.txt", note["file"][1]).status_code == 409             # already in the portal
+        assert resend("again.txt", b"buy now").status_code == 409                    # already rejected for them
+        assert resend("copy.txt", b"ACADEMIC").status_code == 202
+        assert resend("copy2.txt", b"ACADEMIC", login(c, "S1005")).status_code == 409   # already waiting
+        os.environ["MAX_PENDING_UPLOADS"] = "1"
+        assert resend("more.txt", b"another one").status_code == 429                 # one waiting is the limit
+        os.environ["MAX_PENDING_UPLOADS"], os.environ["MAX_STUDENT_UPLOADS_PER_DAY"] = "9", "3"
+        assert resend("more.txt", b"another one").status_code == 429                 # 3 sent in the last 24 hours
+        os.environ["MAX_STUDENT_UPLOADS_PER_DAY"], os.environ["MAX_STUDENT_UPLOAD_MB"] = "9", "1"
+        assert resend("big.txt", b"x" * (1024 * 1024 + 1)).status_code == 413
+        for k in ("MAX_PENDING_UPLOADS", "MAX_STUDENT_UPLOADS_PER_DAY", "MAX_STUDENT_UPLOAD_MB"):
+            del os.environ[k]
+        assert c.get("/admin/uploads", headers=admin).json()[0]["filename"] == "copy.txt"   # nothing else got in
+        assert len(c.get("/admin/uploads", headers=admin).json()) == 1
+        c.post(f"/admin/uploads/{c.get('/admin/uploads', headers=admin).json()[0]['upload_id']}/reject", headers=admin)
+
+        # every ingested document can be viewed and downloaded from the portal
+        f = c.get("/documents/STU-S1004-EXAM-2026-14/file", headers=s4)
+        assert f.content == note["file"][1] and f.headers["content-disposition"].startswith("inline")
+        d = c.get("/documents/SAMPLE-ACAD-REG-2024/file", params={"download": "true"}, headers=s4)
+        assert d.status_code == 200 and d.headers["content-disposition"].startswith("attachment")
+        assert d.content.startswith(b"ACADEMIC REGULATIONS")
+        assert c.get("/documents/SAMPLE-ACAD-REG-2024/file").status_code == 401
+        assert c.get("/documents/NO-SUCH-DOC/file", headers=s4).status_code == 404
+        assert all(s["stored_file"] for s in c.get("/sources").json())
         assert c.post("/admin/rules", json=[], headers=s4).status_code == 403
         assert c.post("/ingest", files=up["files"], headers=admin).status_code == 422  # authority level is required
 
@@ -91,7 +145,7 @@ def test_only_admin_adds_documents_and_metadata_is_extracted():
         assert "You are eligible" in after["answer"]            # the extracted metadata drives precedence
         assert "not eligible" in c.post("/ask", json=BODY, headers=s4).json()["answer"]   # not yet in October
 
-        # an admin has no student records, and may read any audit trace
+        # an admin has no student records, and reads audit traces
         mine = c.post("/ask", json={"question": "What is my attendance?"}, headers=admin).json()
         assert mine["answer_type"] == "refused"
         assert c.get(f"/audit/{after['trace_id']}", headers=admin).status_code == 200
@@ -116,7 +170,7 @@ def test_contract_and_live_ingest():
         assert set(r) >= {"trace_id", "answer", "answer_type", "citations", "tools_invoked", "applied_rules",
                           "conflicts_detected", "explanation", "as_of_date"}
         assert r["answer_type"] == "calculated" and "not eligible" in r["answer"]
-        assert c.get(f"/audit/{r['trace_id']}", headers=s4).json()["trace_id"] == r["trace_id"]
+        assert c.get(f"/audit/{r['trace_id']}", headers=admin).json()["trace_id"] == r["trace_id"]
 
         res = c.post("/ingest", files={"file": ("c.txt", CIRC)}, data={"metadata": json.dumps(META)},
                      headers=admin).json()

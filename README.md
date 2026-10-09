@@ -29,8 +29,9 @@ must be deterministic (R5).
 | Guarantee | Where it is enforced |
 |---|---|
 | Identity only from the login token, never from text (R7) | `api/auth.py` (password login, JWT); `graph/safety.py`; tools only ever receive the token's student ID |
-| A student sees only their own records | `/ask` and `/audit/{trace_id}` require the token; another student's trace returns 404 |
-| Only an admin adds official documents, students or rules | `/admin/*` need the admin role; on `/ingest` a student's upload is forced to authority level 5 (unofficial), gets its own `STU-<student_id>-` doc_id so it cannot replace another document, and sets no rules |
+| A student sees only their own records | `/ask` takes identity from the token; audit records (`/audit/{trace_id}`) are readable by admins only |
+| Only an admin adds official documents, students or rules | `/admin/*` need the admin role |
+| Nothing a student uploads is searchable until an admin has approved it | `api/documents.py`: `/ingest` from a student only queues the file (202 `pending_review`); on approval it is ingested at authority level 5 (unofficial) with its own `STU-<student_id>-` doc_id, so it cannot replace another document, and it sets no rules |
 | A document cannot set its own authority | the admin picks the level; `ingestion/metadata_extractor.py` reads everything else and code checks it against the text |
 | Eligibility and numbers come from code (R5) | `tools/`; verdict sentence built by `graph/templates.py`, not the LLM |
 | Every threshold traces to a clause | `rule_registry.source_doc_id/section`, auto-extracted on ingest |
@@ -75,8 +76,8 @@ tasks. Tests use this with an offline hash embedder: `pytest -q`.
 ## Login
 
 The chat is behind a login. `POST /auth/login` checks the password and returns a
-JWT (HS256, 2 hours); `/ask` and `/audit/{trace_id}` require it as `Authorization: Bearer <token>` and
-take the student's identity from it. The `X-Student-Id` header is ignored.
+JWT (HS256, 2 hours); `/ask` requires it as `Authorization: Bearer <token>` and takes the student's
+identity from it. The `X-Student-Id` header is ignored.
 
 - Every student's first password is `Pass@<student_id>`, for example `Pass@S1004`. This also applies to
   students loaded later with `scripts/load_students.py`. Change it with `POST /auth/change-password`.
@@ -86,9 +87,20 @@ take the student's identity from it. The `X-Student-Id` header is ignored.
 - One admin account is created on first start from `ADMIN_USERNAME` / `ADMIN_PASSWORD` (default
   `admin` / `Admin@123`) and logs in through the same form. Only an admin can choose a document's
   authority level, supply its metadata, or call `/admin/load-students` and `/admin/rules`. An admin
-  has no student records, can ask about the documents, and can read any audit trace.
-- A student can also add a document, but always at authority level 5 (unofficial): it is searchable by
-  everyone as information only, never overrides an official source, and sets no rules.
+  has no student records and can ask about the documents. Audit records are for admins only: the
+  "Audit" tab and `/audit/{trace_id}` return 403 for a student, including for their own questions.
+- A student can submit a document, but it is not indexed. It waits in a review queue; an admin opens
+  the file in the "Review uploads" tab and approves or rejects it, with an optional note the student
+  sees under "My submissions". An approved document is always authority level 5 (unofficial):
+  searchable by everyone as information only, never overriding an official source, setting no rules.
+  Uploads are limited to PDF, TXT, MD and image files of at most `MAX_UPLOAD_MB` (25).
+- A student cannot flood the review queue. Per student: at most `MAX_PENDING_UPLOADS` (3) documents
+  waiting at once, `MAX_STUDENT_UPLOADS_PER_DAY` (5) submissions in 24 hours with rejected ones still
+  counting, and `MAX_STUDENT_UPLOAD_MB` (10) per file. A file identical to one already in the portal,
+  already waiting for review, or already rejected for that student is refused (409).
+- The original file of every ingested document is stored in SQLite (`document_files`). Any logged-in
+  user can view it in the "Documents" tab or download it; `GET /documents/{doc_id}/file` serves it
+  (`?download=true` to save it).
 - The UI always answers as of today. `as_of_date` is still accepted by `POST /ask` for tests and the
   evaluation.
 - The signing key is `JWT_SECRET`; if unset, one is generated into `storage/jwt_secret`.
@@ -118,8 +130,16 @@ curl -s 127.0.0.1:8000/ingest -H "Authorization: Bearer $ADMIN" -F file=@circula
   "issuer":"Dean (Academics)","authority_level":2,"doc_type":"circular","effective_from":"2026-10-01",
   "supersedes":"ACAD-REG-2024#7.2","scope_programmes":"B.Tech","scope_batches":"ALL"}'
 
-curl -s 127.0.0.1:8000/audit/<trace_id> -H "Authorization: Bearer $TOKEN"     # only your own traces
+curl -s 127.0.0.1:8000/audit/<trace_id> -H "Authorization: Bearer $ADMIN"     # admin only
 curl -s 127.0.0.1:8000/sources
+curl -s 127.0.0.1:8000/documents/<doc_id>/file?download=true -H "Authorization: Bearer $TOKEN" -o document.pdf
+
+# student upload -> review queue -> admin decision
+curl -s 127.0.0.1:8000/ingest -H "Authorization: Bearer $TOKEN" -F file=@notes.pdf          # 202 pending_review
+curl -s 127.0.0.1:8000/admin/uploads -H "Authorization: Bearer $ADMIN"                       # the queue
+curl -s -X POST 127.0.0.1:8000/admin/uploads/<upload_id>/approve -H "Authorization: Bearer $ADMIN"
+curl -s -X POST 127.0.0.1:8000/admin/uploads/<upload_id>/reject -H "Authorization: Bearer $ADMIN" \
+  -H 'Content-Type: application/json' -d '{"note":"not a university document"}'
 curl -s 127.0.0.1:8000/health
 python scripts/load_students.py --dir test_students/        # judge test-student loader
 ```

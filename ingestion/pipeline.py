@@ -12,7 +12,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from ingestion import source_register
+from ingestion import document_store, source_register
 from ingestion.chunker import chunk_pages
 from ingestion.cleaner import clean_pages
 from ingestion.loader import load_document
@@ -24,7 +24,7 @@ log = logging.getLogger(__name__)
 
 
 def ingest_file(path: str | Path, meta: DocMetadata, cfg: Optional[RetrievalConfig] = None,
-                extract_rules: bool = True) -> IngestResponse:
+                extract_rules: bool = True, uploaded_by: str = "repository") -> IngestResponse:
     cfg = cfg or RetrievalConfig.from_env()
     pages = clean_pages(load_document(path))
     if not any(p.text.strip() for p in pages):
@@ -34,6 +34,7 @@ def ingest_file(path: str | Path, meta: DocMetadata, cfg: Optional[RetrievalConf
     store.delete_doc(meta.doc_id)            # re-ingesting a doc_id replaces it (idempotent)
     n = store.add(chunks, meta)
     source_register.upsert(meta, str(path))
+    document_store.save(meta.doc_id, Path(path).name, Path(path).read_bytes(), uploaded_by)
     extracted = 0
     if extract_rules:
         from tools.rule_extractor import extract_and_store   # M2 interface

@@ -34,7 +34,8 @@ def all_docs() -> dict[str, DocMetadata]:
 
 
 def all_rows() -> list[dict]:
-    return rows("SELECT * FROM source_register ORDER BY authority_level, effective_from")
+    return rows("SELECT s.*, f.filename AS stored_file, f.size AS stored_size FROM source_register s "
+                "LEFT JOIN document_files f ON f.doc_id = s.doc_id ORDER BY s.authority_level, s.effective_from")
 
 
 def load_csv(path: str | Path) -> list[tuple[DocMetadata, Path]]:

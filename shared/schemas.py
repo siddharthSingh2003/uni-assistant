@@ -162,7 +162,8 @@ class AskResponse(BaseModel):
 class IngestResponse(BaseModel):
     doc_id: str
     chunks_indexed: int
-    status: str
+    status: str                                      # indexed | pending_review
+    upload_id: Optional[str] = None                  # set when a student upload is waiting for an admin
     rules_extracted: int = 0
     rules_added: int = 0
     metadata: Optional[dict[str, Any]] = None        # the Source Register row that was stored
